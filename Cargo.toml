@@ -1,0 +1,78 @@
+[package]
+name = "mmfast"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "A small native Mattermost client: chat, threads, images, attachments, search"
+default-run = "mmfast"
+repository = "https://github.com/mandalaritra1/mmfast"
+readme = "README.md"
+
+[[bin]]
+name = "mmfast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+# The whole UI. glow keeps the binary and the dependency tree small; wgpu is
+# not needed for a 2D chat client.
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "glow", "default_fonts", "wayland", "x11"] }
+egui = "0.36"
+# Shared foundation of Spotifast and ZapFast (crmne/fastframe): the system
+# interface font, colour emoji drawn off the UI thread, platform scrolling.
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-scroll = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+# Lucide icons as SVG (shared set plus ours in assets/icons).
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+# Outlive the window (keep receiving and notifying in the background) and the
+# menu-bar item that brings it back.
+fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+# Networking lives on its own tokio runtime; the UI thread never waits on it.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+# One TLS stack (rustls with ring) for REST and the websocket.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip", "http2", "multipart"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Local cache of teams, channels, users and posts, with FTS5 for instant search.
+rusqlite = { version = "0.37", features = ["bundled"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+emojis = "0.9"
+rfd = "0.17"
+open = "5"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+notify-rust = "4"
+jiff = "0.2"
+url = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The application menu bar. Its Edit items own Cmd+C/X/V/A/Z: on macOS egui
+# does not reliably receive those key equivalents (ZapFast does the same).
+# The version fastframe-tray (tray-icon) uses, so both share one handler.
+muda = { version = "0.20", default-features = false }
+# The Apple Event that delivers mmauth:// links (single sign-on returns
+# through one). eframe and muda already compile these versions.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSString", "NSObject"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2

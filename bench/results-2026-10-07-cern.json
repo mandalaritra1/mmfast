@@ -1,0 +1,82 @@
+{
+ "runs": {
+  "Mattermost": [
+   {
+    "window_ms": 613,
+    "settled_s": 4.64,
+    "startup_cpu_s": 4.3,
+    "footprint_mb": 653,
+    "processes": 10,
+    "threads": 191,
+    "idle_cpu_s_30s": 1.11
+   },
+   {
+    "window_ms": 458,
+    "settled_s": 4.53,
+    "startup_cpu_s": 4.38,
+    "footprint_mb": 701,
+    "processes": 10,
+    "threads": 191,
+    "idle_cpu_s_30s": 1.25
+   },
+   {
+    "window_ms": 517,
+    "settled_s": 6.07,
+    "startup_cpu_s": 4.38,
+    "footprint_mb": 669,
+    "processes": 10,
+    "threads": 188,
+    "idle_cpu_s_30s": 1.45
+   }
+  ],
+  "mmfast": [
+   {
+    "window_ms": 533,
+    "settled_s": 0.82,
+    "startup_cpu_s": 0.59,
+    "footprint_mb": 212,
+    "processes": 1,
+    "threads": 9,
+    "idle_cpu_s_30s": 0.05
+   },
+   {
+    "window_ms": 738,
+    "settled_s": 1.03,
+    "startup_cpu_s": 0.7,
+    "footprint_mb": 215,
+    "processes": 1,
+    "threads": 8,
+    "idle_cpu_s_30s": 0.08
+   },
+   {
+    "window_ms": 331,
+    "settled_s": 0.62,
+    "startup_cpu_s": 0.45,
+    "footprint_mb": 188,
+    "processes": 1,
+    "threads": 10,
+    "idle_cpu_s_30s": 0.1
+   }
+  ]
+ },
+ "medians": {
+  "Mattermost": {
+   "window_ms": 517,
+   "settled_s": 4.64,
+   "startup_cpu_s": 4.38,
+   "footprint_mb": 669,
+   "processes": 10,
+   "threads": 191,
+   "idle_cpu_s_30s": 1.25
+  },
+  "mmfast": {
+   "window_ms": 533,
+   "settled_s": 0.82,
+   "startup_cpu_s": 0.59,
+   "footprint_mb": 212,
+   "processes": 1,
+   "threads": 9,
+   "idle_cpu_s_30s": 0.08
+  }
+ }
+}

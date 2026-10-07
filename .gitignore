@@ -1,0 +1,4 @@
+target/
+dist/
+dev/seed-credentials.json
+.DS_Store

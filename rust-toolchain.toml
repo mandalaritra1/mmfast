@@ -1,0 +1,4 @@
+# The same compiler, clippy and rustfmt everywhere (fastframe needs 1.98+).
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
