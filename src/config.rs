@@ -24,6 +24,8 @@ pub struct Config {
     /// Closing the window keeps the app in the menu bar (notifications go on).
     #[serde(default = "yes")]
     pub keep_running: bool,
+    /// The account signed in on each server: its local cache is that account's.
+    pub accounts: HashMap<String, String>,
 }
 
 fn yes() -> bool {
@@ -81,6 +83,7 @@ impl Default for Config {
             last_team: String::new(),
             last_channel: HashMap::new(),
             keep_running: true,
+            accounts: HashMap::new(),
         }
     }
 }

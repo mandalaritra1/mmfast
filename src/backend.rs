@@ -30,8 +30,9 @@ pub enum UploadData {
 pub enum Command {
     Login { server: String, method: LoginMethod },
     /// Find the server's single sign-on page.
-    SsoStart { server: String },
-    Start { server: String, token: String },
+    SsoStart { server: String, redirect: String },
+    /// `user_id`: whose local cache to open; `None` asks the server first.
+    Start { server: String, token: String, user_id: Option<String> },
     Logout,
     OpenChannel { channel_id: String },
     LoadOlder { channel_id: String, before_id: String },
@@ -79,7 +80,13 @@ pub enum PostsMode {
 pub enum Event {
     LoginFailed(String),
     SsoUrl(String),
-    LoggedIn { server: String, token: String },
+    LoggedIn { server: String, token: String, user_id: String },
+    /// The session's account, once known (for a session started without it).
+    SessionUser { server: String, user_id: String },
+    /// The server could not be reached to start the session; try again later.
+    StartFailed,
+    /// Paging back failed; the view may ask again.
+    OlderFailed { channel_id: String },
     Snapshot { snap: Snapshot, from_cache: bool },
     ChannelPosts { channel_id: String, posts: Vec<Post>, mode: PostsMode, reached_start: Option<bool> },
     ThreadPosts { root_id: String, posts: Vec<Post> },
@@ -174,7 +181,12 @@ struct Session {
     known_users: Mutex<HashSet<String>>,
     images: Semaphore,
     ws_out: mpsc::UnboundedSender<WsOut>,
-    ws_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Every long-lived task this session started; aborted on stop.
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Set on stop: requests still in flight must not reach the next session.
+    stopped: std::sync::atomic::AtomicBool,
+    user_id: String,
+    dirs: (PathBuf, PathBuf),
 }
 
 fn server_slug(server: &str) -> String {
@@ -195,34 +207,54 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, out: Emitter, data_
                 let out = out.clone();
                 tokio::spawn(async move {
                     let result = match method {
-                        LoginMethod::Password { login_id, password, mfa } => {
-                            Api::login(&server, &login_id, &password, &mfa).await.map(|(t, _)| t)
-                        }
+                        LoginMethod::Password { login_id, password, mfa } => Api::login(&server, &login_id, &password, &mfa).await,
                         LoginMethod::Token(token) => {
                             let token = token.trim().to_string();
-                            Api::new(&server, &token).me().await.map(|_| token)
+                            Api::new(&server, &token).me().await.map(|me| (token, me))
                         }
                     };
                     match result {
-                        Ok(token) => out.emit(Event::LoggedIn { server: api::normalize_server(&server), token }),
+                        Ok((token, me)) => {
+                            out.emit(Event::LoggedIn { server: api::normalize_server(&server), token, user_id: me.id })
+                        }
                         Err(err) => out.emit(Event::LoginFailed(format!("{err:#}"))),
                     }
                 });
             }
-            Command::SsoStart { server } => {
+            Command::SsoStart { server, redirect } => {
                 let out = out.clone();
                 tokio::spawn(async move {
-                    match Api::sso_url(&server, crate::app::SSO_REDIRECT).await {
+                    match Api::sso_url(&server, &redirect).await {
                         Ok(url) => out.emit(Event::SsoUrl(url)),
                         Err(err) => out.emit(Event::LoginFailed(format!("{err:#}"))),
                     }
                 });
             }
-            Command::Start { server, token } => {
+            Command::Start { server, token, user_id } => {
                 if let Some(old) = session.take() {
                     old.stop();
                 }
-                match Session::start(&server, &token, out.clone(), &data_dir, &cache_dir) {
+                // A session started without its account (development, the
+                // environment) learns it first: the cache is per account.
+                let user_id = match user_id {
+                    Some(id) => id,
+                    None => match Api::new(&server, &token).me().await {
+                        Ok(me) => {
+                            out.emit(Event::SessionUser { server: api::normalize_server(&server), user_id: me.id.clone() });
+                            me.id
+                        }
+                        Err(err) if api::is_unauthorized(&err) => {
+                            out.emit(Event::Unauthorized);
+                            continue;
+                        }
+                        Err(err) => {
+                            out.emit(Event::Connection { connected: false, detail: format!("{err:#}") });
+                            out.emit(Event::StartFailed);
+                            continue;
+                        }
+                    },
+                };
+                match Session::start(&server, &token, &user_id, out.clone(), &data_dir, &cache_dir) {
                     Ok(s) => session = Some(s),
                     Err(err) => out.emit(Event::Toast(format!("could not open the local cache: {err:#}"))),
                 }
@@ -232,6 +264,11 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, out: Emitter, data_
                     s.stop();
                     tokio::spawn(async move {
                         let _ = s.api.logout().await;
+                        // Signing out takes this account's local copy with it.
+                        let (data, cache) = s.dirs.clone();
+                        drop(s);
+                        let _ = tokio::fs::remove_dir_all(data).await;
+                        let _ = tokio::fs::remove_dir_all(cache).await;
                     });
                 }
             }
@@ -250,10 +287,20 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, out: Emitter, data_
 }
 
 impl Session {
-    fn start(server: &str, token: &str, out: Emitter, data_dir: &Path, cache_dir: &Path) -> Result<Arc<Self>> {
+    fn start(server: &str, token: &str, user_id: &str, out: Emitter, data_dir: &Path, cache_dir: &Path) -> Result<Arc<Self>> {
         let slug = server_slug(server);
-        let store = Store::open(&data_dir.join("servers").join(&slug).join("cache.db"))?;
-        let files_dir = cache_dir.join("servers").join(&slug).join("files");
+        let user: String = user_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        anyhow::ensure!(!user.is_empty(), "no account to open a cache for");
+        // Before 0.1.1 one cache served every account of a server: remove it.
+        let legacy_db = data_dir.join("servers").join(&slug).join("cache.db");
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", legacy_db.display()));
+        }
+        let _ = std::fs::remove_dir_all(cache_dir.join("servers").join(&slug).join("files"));
+        let data = data_dir.join("servers").join(&slug).join(&user);
+        let cache = cache_dir.join("servers").join(&slug).join(&user);
+        let store = Store::open(&data.join("cache.db"))?;
+        let files_dir = cache.join("files");
         std::fs::create_dir_all(&files_dir)?;
         let cached = store.snapshot();
         let known = store.known_users();
@@ -267,25 +314,50 @@ impl Session {
             known_users: Mutex::new(known),
             images: Semaphore::new(6),
             ws_out,
-            ws_task: Mutex::new(None),
+            tasks: Mutex::new(Vec::new()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            user_id: user_id.to_string(),
+            dirs: (data, cache),
         });
-        if let Some(snap) = cached {
-            session.out.emit(Event::Snapshot { snap, from_cache: true });
+        if let Some(snap) = cached.filter(|c| c.me.id == user_id) {
+            session.emit(Event::Snapshot { snap, from_cache: true });
         }
         let s = session.clone();
-        tokio::spawn(async move {
-            if let Err(err) = s.sync_snapshot().await {
-                s.report(err);
-                return;
+        let bootstrap = tokio::spawn(async move {
+            // Offline at launch: keep trying, the cache is already on screen.
+            let mut wait = 2u64;
+            loop {
+                match s.sync_snapshot().await {
+                    Ok(()) => break,
+                    Err(err) if api::is_unauthorized(&err) => {
+                        s.report(err);
+                        return;
+                    }
+                    Err(err) => {
+                        log::warn!("first sync failed, retrying in {wait} s: {err:#}");
+                        s.emit(Event::Connection { connected: false, detail: format!("{err:#}") });
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        wait = (wait * 2).min(60);
+                    }
+                }
             }
             s.clone().start_ws(ws_out_rx);
         });
+        session.tasks.lock().unwrap().push(bootstrap);
         Ok(session)
     }
 
+    /// Ends the session: its tasks stop, and nothing still in flight reaches the app.
     fn stop(&self) {
-        if let Some(task) = self.ws_task.lock().unwrap().take() {
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        for task in self.tasks.lock().unwrap().drain(..) {
             task.abort();
+        }
+    }
+
+    fn emit(&self, event: Event) {
+        if !self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            self.out.emit(event);
         }
     }
 
@@ -295,15 +367,21 @@ impl Session {
 
     fn report(&self, err: anyhow::Error) {
         if api::is_unauthorized(&err) {
-            self.out.emit(Event::Unauthorized);
+            self.emit(Event::Unauthorized);
         } else {
             log::warn!("{err:#}");
-            self.out.emit(Event::Toast(format!("{err:#}")));
+            self.emit(Event::Toast(format!("{err:#}")));
         }
     }
 
     async fn sync_snapshot(&self) -> Result<()> {
         let me = self.api.me().await?;
+        if me.id != self.user_id {
+            // The token belongs to another account than this cache's.
+            self.emit(Event::Toast("The saved session belongs to another account; please sign in again.".into()));
+            self.emit(Event::Unauthorized);
+            anyhow::bail!("session account changed");
+        }
         *self.me.lock().unwrap() = me.clone();
         let teams = self.api.my_teams().await?;
         let mut channels: Vec<Channel> = Vec::new();
@@ -336,7 +414,7 @@ impl Session {
                 && !changed.is_empty()
             {
                 self.store.lock().unwrap().save_users(&changed);
-                self.out.emit(Event::Users(changed));
+                self.emit(Event::Users(changed));
             }
         }
         self.store.lock().unwrap().set_kv("users_sync", &started.to_string());
@@ -349,7 +427,7 @@ impl Session {
             store.save_snapshot(&snap)?;
             snap.users = store.snapshot().map(|s| s.users).unwrap_or_default();
         }
-        self.out.emit(Event::Snapshot { snap, from_cache: false });
+        self.emit(Event::Snapshot { snap, from_cache: false });
         Ok(())
     }
 
@@ -369,7 +447,7 @@ impl Session {
             Ok(users) => {
                 self.store.lock().unwrap().save_users(&users);
                 self.known_users.lock().unwrap().extend(users.iter().map(|u| u.id.clone()));
-                self.out.emit(Event::Users(users));
+                self.emit(Event::Users(users));
             }
             Err(err) => log::warn!("user lookup failed: {err:#}"),
         }
@@ -400,38 +478,45 @@ impl Session {
                 s.on_ws(ev, &mut first).await;
             }
         });
-        *self.ws_task.lock().unwrap() = Some(tokio::spawn(async move {
-            let _ = tokio::join!(socket, pump);
-        }));
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.push(socket);
+        tasks.push(pump);
+        if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+        }
     }
 
     async fn on_ws(&self, ev: WsEvent, first: &mut bool) {
         match ev {
             WsEvent::Connected => {
-                self.out.emit(Event::Connection { connected: true, detail: String::new() });
-                if !*first {
-                    if let Err(err) = self.sync_snapshot().await {
-                        self.report(err);
-                    }
-                    self.out.emit(Event::Reconnected);
+                self.emit(Event::Connection { connected: true, detail: String::new() });
+                if !*first
+                    && let Err(err) = self.sync_snapshot().await
+                {
+                    self.report(err);
                 }
+                // Also the first time: posts made between the initial REST
+                // reads and the socket opening are fetched now.
+                self.emit(Event::Reconnected);
                 *first = false;
             }
-            WsEvent::Disconnected(detail) => self.out.emit(Event::Connection { connected: false, detail }),
+            WsEvent::Disconnected(detail) => self.emit(Event::Connection { connected: false, detail }),
             WsEvent::Posted { post, mentions } => {
                 let me = self.me_id();
                 self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
                 self.users_of(std::slice::from_ref(&post)).await;
                 let mentions_me = mentions.iter().any(|m| m == &me);
-                self.out.emit(Event::PostUpsert { post, mentions_me, live: true });
+                self.emit(Event::PostUpsert { post, mentions_me, live: true });
             }
             WsEvent::PostEdited(post) => {
                 self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
-                self.out.emit(Event::PostUpsert { post, mentions_me: false, live: false });
+                self.emit(Event::PostUpsert { post, mentions_me: false, live: false });
             }
             WsEvent::PostDeleted(post) => {
                 self.store.lock().unwrap().delete_post(&post.id);
-                self.out.emit(Event::PostDeleted { post });
+                self.emit(Event::PostDeleted { post });
             }
             WsEvent::Reaction { reaction, added } => {
                 {
@@ -447,18 +532,22 @@ impl Session {
                     }
                 }
                 self.ensure_users([reaction.user_id.clone()]).await;
-                self.out.emit(Event::Reaction { reaction, added });
+                self.emit(Event::Reaction { reaction, added });
             }
             WsEvent::Typing { channel_id, parent_id, user_id } => {
                 if user_id != self.me_id() {
                     self.ensure_users([user_id.clone()]).await;
-                    self.out.emit(Event::Typing { channel_id, parent_id, user_id });
+                    self.emit(Event::Typing { channel_id, parent_id, user_id });
                 }
             }
-            WsEvent::ChannelViewed { channel_id } => self.out.emit(Event::ChannelViewed { channel_id }),
+            WsEvent::ChannelsViewed { channel_ids } => {
+                for channel_id in channel_ids {
+                    self.emit(Event::ChannelViewed { channel_id });
+                }
+            }
             WsEvent::ChannelUpdated(channel) => {
                 self.store.lock().unwrap().save_channel(&channel);
-                self.out.emit(Event::ChannelUpdated(channel));
+                self.emit(Event::ChannelUpdated(channel));
             }
             WsEvent::Resync => {
                 if let Err(err) = self.sync_snapshot().await {
@@ -467,13 +556,13 @@ impl Session {
             }
             WsEvent::UserUpdated(user) => {
                 self.store.lock().unwrap().save_users(std::slice::from_ref(&user));
-                self.out.emit(Event::Users(vec![user]));
+                self.emit(Event::Users(vec![user]));
             }
-            WsEvent::ThreadUpdated => self.out.emit(Event::ThreadUpdated),
+            WsEvent::ThreadUpdated => self.emit(Event::ThreadUpdated),
             WsEvent::MemberUpdated(member) => {
                 if member.user_id == self.me_id() {
                     self.store.lock().unwrap().save_member(&member);
-                    self.out.emit(Event::MemberUpdated(member));
+                    self.emit(Event::MemberUpdated(member));
                 }
             }
             WsEvent::CategoriesChanged { team_id } => {
@@ -487,40 +576,72 @@ impl Session {
     }
 
     async fn handle(&self, command: Command) -> Result<()> {
+        // What an optimistic change touched, to restore if the server refuses it.
+        let touched = match &command {
+            Command::Edit { post_id, .. }
+            | Command::Delete { post_id }
+            | Command::React { post_id, .. }
+            | Command::Pin { post_id, .. } => Some((post_id.clone(), None)),
+            Command::PatchHeader { channel_id, .. } => Some((String::new(), Some(channel_id.clone()))),
+            _ => None,
+        };
+        let result = self.handle_inner(command).await;
+        if result.is_err()
+            && let Some((post_id, channel_id)) = touched
+        {
+            if let Some(ch) = channel_id {
+                if let Ok(channel) = self.api.channel(&ch).await {
+                    self.emit(Event::ChannelUpdated(channel));
+                }
+            } else if let Ok(post) = self.api.post_by_id(&post_id).await {
+                self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
+                self.emit(Event::PostUpsert { post, mentions_me: false, live: false });
+            }
+        }
+        result
+    }
+
+    async fn handle_inner(&self, command: Command) -> Result<()> {
         match command {
             Command::OpenChannel { channel_id } => self.open_channel(&channel_id).await?,
             Command::LoadOlder { channel_id, before_id } => {
-                let mut posts = self.api.channel_posts(&channel_id, &format!("before={before_id}&per_page=60")).await?;
+                let mut posts = match self.api.channel_posts(&channel_id, &format!("before={before_id}&per_page=60")).await {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.emit(Event::OlderFailed { channel_id });
+                        return Err(err);
+                    }
+                };
                 posts.reverse();
                 let reached = posts.len() < 60;
                 self.store.lock().unwrap().save_posts(&posts);
                 self.users_of(&posts).await;
-                self.out.emit(Event::ChannelPosts { channel_id, posts, mode: PostsMode::Older, reached_start: Some(reached) });
+                self.emit(Event::ChannelPosts { channel_id, posts, mode: PostsMode::Older, reached_start: Some(reached) });
             }
             Command::OpenThread { root_id } => {
                 let cached = self.store.lock().unwrap().thread(&root_id);
                 if cached.len() > 1 {
-                    self.out.emit(Event::ThreadPosts { root_id: root_id.clone(), posts: cached });
+                    self.emit(Event::ThreadPosts { root_id: root_id.clone(), posts: cached });
                 }
                 let mut posts = self.api.thread(&root_id).await?;
                 posts.sort_by_key(|p| p.create_at);
                 self.store.lock().unwrap().save_posts(&posts);
                 self.users_of(&posts).await;
-                self.out.emit(Event::ThreadPosts { root_id, posts });
+                self.emit(Event::ThreadPosts { root_id, posts });
             }
             Command::Send { channel_id, root_id, message, pending_id, file_ids } => {
                 match self.api.create_post(&channel_id, &root_id, &message, &pending_id, &file_ids).await {
                     Ok(post) => {
                         self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
-                        self.out.emit(Event::PostUpsert { post, mentions_me: false, live: false });
+                        self.emit(Event::PostUpsert { post, mentions_me: false, live: false });
                     }
-                    Err(err) => self.out.emit(Event::SendFailed { pending_id, error: format!("{err:#}") }),
+                    Err(err) => self.emit(Event::SendFailed { pending_id, error: format!("{err:#}") }),
                 }
             }
             Command::Edit { post_id, message } => {
                 let post = self.api.edit_post(&post_id, &message).await?;
                 self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
-                self.out.emit(Event::PostUpsert { post, mentions_me: false, live: false });
+                self.emit(Event::PostUpsert { post, mentions_me: false, live: false });
             }
             Command::Delete { post_id } => self.api.delete_post(&post_id).await?,
             Command::React { post_id, emoji, add } => {
@@ -535,7 +656,7 @@ impl Session {
                 self.api.set_pinned(&post_id, pinned).await?;
                 let post = self.api.post_by_id(&post_id).await?;
                 self.store.lock().unwrap().save_posts(std::slice::from_ref(&post));
-                self.out.emit(Event::PostUpsert { post, mentions_me: false, live: false });
+                self.emit(Event::PostUpsert { post, mentions_me: false, live: false });
             }
             Command::ViewChannel { channel_id } => self.api.view_channel(&channel_id).await?,
             Command::Upload { local_id, channel_id, name, data } => {
@@ -548,7 +669,7 @@ impl Session {
                 }
                 .await
                 .map_err(|e| format!("{e:#}"));
-                self.out.emit(Event::UploadDone { local_id, result });
+                self.emit(Event::UploadDone { local_id, result });
             }
             Command::Image(key) => self.load_image(key).await,
             Command::Search { seq, team_id, terms, server } => {
@@ -557,9 +678,8 @@ impl Session {
                         tokio::join!(self.api.search_posts(&team_id, &terms), self.api.search_files(&team_id, &terms));
                     let error = posts.as_ref().err().map(|e| format!("{e:#}"));
                     let posts = posts.unwrap_or_default();
-                    self.store.lock().unwrap().save_posts(&posts);
                     self.users_of(&posts).await;
-                    self.out.emit(Event::SearchResults {
+                    self.emit(Event::SearchResults {
                         seq,
                         posts,
                         files: files.unwrap_or_default(),
@@ -568,23 +688,23 @@ impl Session {
                     });
                 } else {
                     let posts = self.store.lock().unwrap().search(&terms, 40);
-                    self.out.emit(Event::SearchResults { seq, posts, files: Vec::new(), server: false, error: None });
+                    self.emit(Event::SearchResults { seq, posts, files: Vec::new(), server: false, error: None });
                 }
             }
             Command::LoadPinned { channel_id } => {
                 let mut posts = self.api.pinned(&channel_id).await?;
                 posts.sort_by_key(|p| std::cmp::Reverse(p.create_at));
                 self.users_of(&posts).await;
-                self.out.emit(Event::Pinned { channel_id, posts });
+                self.emit(Event::Pinned { channel_id, posts });
             }
             Command::LoadStats { channel_id } => {
                 let stats = self.api.channel_stats(&channel_id).await?;
-                self.out.emit(Event::Stats(stats));
+                self.emit(Event::Stats(stats));
             }
             Command::PatchHeader { channel_id, header } => {
                 let channel = self.api.patch_channel_header(&channel_id, &header).await?;
                 self.store.lock().unwrap().save_channel(&channel);
-                self.out.emit(Event::ChannelUpdated(channel));
+                self.emit(Event::ChannelUpdated(channel));
             }
             Command::LoadThreads { team_id } => {
                 let me = self.me_id();
@@ -593,7 +713,7 @@ impl Session {
                 let mut ids: Vec<String> = threads.threads.iter().flat_map(|t| t.participants.iter().map(|u| u.id.clone())).collect();
                 ids.extend(posts.iter().map(|p| p.user_id.clone()));
                 self.ensure_users(ids).await;
-                self.out.emit(Event::Threads { team_id, threads });
+                self.emit(Event::Threads { team_id, threads });
             }
             Command::MarkThreadRead { team_id, thread_id } => {
                 let me = self.me_id();
@@ -604,14 +724,14 @@ impl Session {
                 if let (true, Ok(path)) = (open, &result) {
                     let _ = open::that_detached(path);
                 }
-                self.out.emit(Event::Downloaded { name: file.name.clone(), result: result.map_err(|e| format!("{e:#}")) });
+                self.emit(Event::Downloaded { name: file.name.clone(), result: result.map_err(|e| format!("{e:#}")) });
             }
             Command::Autocomplete { team_id, channel_id, prefix } => {
                 let users = self.api.autocomplete_users(&team_id, &channel_id, &prefix).await?;
                 self.store.lock().unwrap().save_users(&users);
                 self.known_users.lock().unwrap().extend(users.iter().map(|u| u.id.clone()));
                 let _ = prefix;
-                self.out.emit(Event::Autocomplete { users });
+                self.emit(Event::Autocomplete { users });
             }
             Command::Typing { channel_id, parent_id } => {
                 let _ = self.ws_out.send(WsOut::Typing { channel_id, parent_id });
@@ -620,7 +740,7 @@ impl Session {
             Command::LoadCategories { team_id } => {
                 let cached = self.store.lock().unwrap().get_kv(&format!("cats:{team_id}"));
                 if let Some(categories) = cached.and_then(|j| serde_json::from_str(&j).ok()) {
-                    self.out.emit(Event::Categories { team_id: team_id.clone(), categories });
+                    self.emit(Event::Categories { team_id: team_id.clone(), categories });
                 }
                 self.load_categories(&team_id).await?;
             }
@@ -657,13 +777,13 @@ impl Session {
                 self.api.set_notify_props(&channel_id, &me, serde_json::json!({ "mark_unread": mark })).await?;
                 let member = self.api.member(&channel_id).await?;
                 self.store.lock().unwrap().save_member(&member);
-                self.out.emit(Event::MemberUpdated(member));
+                self.emit(Event::MemberUpdated(member));
             }
             Command::BrowseChannels { team_id, term } => {
                 let mut channels = self.api.browse_channels(&team_id, &term).await?;
                 channels.retain(|c| c.delete_at == 0);
                 channels.sort_by_key(|c| c.display_name.to_lowercase());
-                self.out.emit(Event::BrowseResults { term, channels });
+                self.emit(Event::BrowseResults { term, channels });
             }
             Command::JoinChannel { channel_id } => {
                 let me = self.me_id();
@@ -673,23 +793,23 @@ impl Session {
             Command::LeaveChannel { channel_id } => {
                 let me = self.me_id();
                 self.api.leave_channel(&channel_id, &me).await?;
-                self.out.emit(Event::ChannelLeft { channel_id });
+                self.emit(Event::ChannelLeft { channel_id });
             }
             Command::JumpPost { post_id } => {
                 let post = self.api.post_by_id(&post_id).await?;
                 self.users_of(std::slice::from_ref(&post)).await;
-                self.out.emit(Event::JumpPost(post));
+                self.emit(Event::JumpPost(post));
             }
             Command::LoadEmoji => {
                 let cached = self.store.lock().unwrap().get_kv("emoji");
                 if let Some(list) = cached.and_then(|j| serde_json::from_str(&j).ok()) {
-                    self.out.emit(Event::CustomEmoji(list));
+                    self.emit(Event::CustomEmoji(list));
                 }
                 let list = self.api.custom_emoji().await?;
                 if let Ok(j) = serde_json::to_string(&list) {
                     self.store.lock().unwrap().set_kv("emoji", &j);
                 }
-                self.out.emit(Event::CustomEmoji(list));
+                self.emit(Event::CustomEmoji(list));
             }
             Command::OpenDm { user_id } => {
                 let me = self.me_id();
@@ -707,7 +827,7 @@ impl Session {
         if let Ok(j) = serde_json::to_string(&categories) {
             self.store.lock().unwrap().set_kv(&format!("cats:{team_id}"), &j);
         }
-        self.out.emit(Event::Categories { team_id: team_id.to_string(), categories });
+        self.emit(Event::Categories { team_id: team_id.to_string(), categories });
         Ok(())
     }
 
@@ -720,7 +840,7 @@ impl Session {
             store.save_channel(&channel);
             store.save_member(&member);
         }
-        self.out.emit(Event::ChannelJoined { channel, member });
+        self.emit(Event::ChannelJoined { channel, member });
         Ok(())
     }
 
@@ -735,7 +855,7 @@ impl Session {
             )
         };
         if !cached.is_empty() {
-            self.out.emit(Event::ChannelPosts {
+            self.emit(Event::ChannelPosts {
                 channel_id: channel_id.to_string(),
                 posts: cached,
                 mode: PostsMode::Latest,
@@ -762,7 +882,7 @@ impl Session {
         }
         self.users_of(&latest).await;
         let reached_start = if newest_cached.is_none() || gap { Some(!full_page) } else { None };
-        self.out.emit(Event::ChannelPosts {
+        self.emit(Event::ChannelPosts {
             channel_id: channel_id.to_string(),
             posts: latest,
             mode: if gap || newest_cached.is_none() { PostsMode::Latest } else { PostsMode::Merge },
@@ -773,7 +893,14 @@ impl Session {
         if let Some(since) = last_sync
             && !gap
         {
-            let changed = self.api.channel_posts(channel_id, &format!("since={since}")).await.unwrap_or_default();
+            // A failed catch-up keeps the old checkpoint, so the next visit asks again.
+            let changed = match self.api.channel_posts(channel_id, &format!("since={since}")).await {
+                Ok(c) => c,
+                Err(err) => {
+                    log::warn!("catch-up failed: {err:#}");
+                    return Ok(());
+                }
+            };
             let (deleted, live): (Vec<Post>, Vec<Post>) = changed.into_iter().partition(|p| p.delete_at > 0);
             {
                 let mut store = self.store.lock().unwrap();
@@ -783,11 +910,11 @@ impl Session {
                 }
             }
             for post in deleted {
-                self.out.emit(Event::PostDeleted { post });
+                self.emit(Event::PostDeleted { post });
             }
             if !live.is_empty() {
                 self.users_of(&live).await;
-                self.out.emit(Event::ChannelPosts {
+                self.emit(Event::ChannelPosts {
                     channel_id: channel_id.to_string(),
                     posts: live.into_iter().filter(|p| p.root_id.is_empty()).collect(),
                     mode: PostsMode::Merge,
@@ -820,7 +947,7 @@ impl Session {
                 Some(b) => tokio::task::spawn_blocking(move || decode_gif(&b, 640)).await.ok().flatten(),
                 None => None,
             };
-            self.out.emit(Event::Animation { key, frames });
+            self.emit(Event::Animation { key, frames });
             return;
         }
         let max = match key {
@@ -832,7 +959,7 @@ impl Session {
             Some(b) => tokio::task::spawn_blocking(move || decode(&b, max)).await.ok().flatten(),
             None => None,
         };
-        self.out.emit(Event::Image { key, image: image.map(Arc::new) });
+        self.emit(Event::Image { key, image: image.map(Arc::new) });
     }
 
     async fn download(&self, file: &FileInfo) -> Result<PathBuf> {
@@ -840,25 +967,46 @@ impl Session {
         let dir = directories::UserDirs::new()
             .and_then(|d| d.download_dir().map(Path::to_path_buf))
             .unwrap_or_else(std::env::temp_dir);
-        let mut path = dir.join(&file.name);
-        let (stem, ext) = match file.name.rsplit_once('.') {
-            Some((s, e)) => (s.to_string(), format!(".{e}")),
-            None => (file.name.clone(), String::new()),
+        // The name comes from the server: keep one plain component of it, and
+        // claim the destination atomically so two downloads cannot collide.
+        let name = safe_file_name(&file.name);
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+            _ => (name.clone(), String::new()),
         };
-        let mut n = 1;
-        while path.exists() {
-            path = dir.join(format!("{stem} ({n}){ext}"));
-            n += 1;
+        for n in 0..1000 {
+            let candidate = if n == 0 { dir.join(&name) } else { dir.join(format!("{stem} ({n}){ext}")) };
+            match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+                Ok(mut f) => {
+                    use tokio::io::AsyncWriteExt;
+                    f.write_all(&bytes).await?;
+                    return Ok(candidate);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        tokio::fs::write(&path, bytes).await?;
-        Ok(path)
+        anyhow::bail!("no free file name for {name}")
     }
+}
+
+/// A server-supplied file name reduced to one harmless path component.
+pub fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = last
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .collect();
+    let clean = clean.trim().trim_start_matches('.').trim().to_string();
+    if clean.is_empty() { "download".into() } else { clean.chars().take(200).collect() }
 }
 
 /// Every frame of a GIF (up to 300), scaled to fit `max`, with its delay.
 fn decode_gif(bytes: &[u8], max: u32) -> Option<Vec<(Arc<ColorImage>, f32)>> {
     use image::AnimationDecoder;
     let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    const BUDGET: usize = 48 << 20;
+    let mut bytes_used = 0usize;
     let mut out = Vec::new();
     for frame in decoder.into_frames().take(300) {
         let frame = frame.ok()?;
@@ -870,6 +1018,10 @@ fn decode_gif(bytes: &[u8], max: u32) -> Option<Vec<(Arc<ColorImage>, f32)>> {
         let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
         let rgba = img.to_rgba8();
         let size = [rgba.width() as usize, rgba.height() as usize];
+        bytes_used += size[0] * size[1] * 4;
+        if bytes_used > BUDGET && !out.is_empty() {
+            break;
+        }
         out.push((Arc::new(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())), secs));
     }
     if out.is_empty() { None } else { Some(out) }
@@ -881,4 +1033,19 @@ fn decode(bytes: &[u8], max: u32) -> Option<ColorImage> {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_name;
+
+    #[test]
+    fn download_names_stay_in_the_folder() {
+        assert_eq!(safe_file_name("../../.ssh/authorized_keys"), "authorized_keys");
+        assert_eq!(safe_file_name("/etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("..\\..\\x.txt"), "x.txt");
+        assert_eq!(safe_file_name(".."), "download");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name("AN draft v3.pdf"), "AN draft v3.pdf");
+    }
 }

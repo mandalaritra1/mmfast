@@ -49,6 +49,15 @@ impl VList {
             self.heights.clear();
             self.width = width;
         }
+        if reveal.is_none() {
+            // The next jump, even to the same row, is a new request.
+            self.reveal_done = None;
+        }
+        if self.heights.len() > 4 * rows.len().max(500) {
+            // Stale revisions of rows: keep what is still listed.
+            let live: std::collections::HashSet<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+            self.heights.retain(|k, _| live.contains(k.as_str()));
+        }
         let heights: Vec<f32> = rows.iter().map(|r| self.heights.get(&r.key).copied().unwrap_or(r.estimate)).collect();
         let mut tops = Vec::with_capacity(rows.len());
         let mut y = 0.0;
@@ -99,7 +108,12 @@ impl VList {
             let mut i = start;
             while i < rows.len() && tops[i] < viewport.max.y + margin {
                 let rect = Rect::from_min_size(origin + vec2(0.0, tops[i]), vec2(width, f32::INFINITY));
-                let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+                // A stable identity per row (its id, not its revision or its
+                // place among drawn rows) keeps selection and focus with it.
+                let stable = rows[i].key.split('|').next().unwrap_or_default();
+                let mut child = ui.new_child(
+                    UiBuilder::new().id_salt(stable).max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
+                );
                 child.set_width(width);
                 draw(&mut child, i);
                 let h = child.min_rect().height().max(1.0);

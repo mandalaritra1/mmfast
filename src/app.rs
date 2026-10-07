@@ -39,6 +39,8 @@ pub struct ChannelView {
     pub unread_after: i64,
     pub reveal: Option<String>,
     pub reveal_tries: u8,
+    /// When paging back last failed; it is retried after a pause.
+    pub older_failed_at: Option<f64>,
     pub highlight: Option<(String, f64)>,
 }
 
@@ -50,7 +52,9 @@ impl ChannelView {
             self.posts.remove(i);
         }
         if let Some(existing) = self.posts.iter_mut().find(|p| p.id == post.id) {
-            *existing = post;
+            if post.update_at >= existing.update_at || existing.pending {
+                *existing = post;
+            }
             return;
         }
         let at = self.posts.iter().rposition(|p| !p.pending && p.create_at <= post.create_at).map(|i| i + 1).unwrap_or(0);
@@ -73,7 +77,9 @@ impl ThreadData {
             self.posts.remove(i);
         }
         if let Some(existing) = self.posts.iter_mut().find(|p| p.id == post.id) {
-            *existing = post;
+            if post.update_at >= existing.update_at || existing.pending {
+                *existing = post;
+            }
         } else {
             self.posts.push(post);
             self.posts.sort_by_key(|p| (p.pending, p.create_at));
@@ -308,6 +314,8 @@ pub enum SearchTab {
 pub struct LoginForm {
     /// Single sign-on in progress: started at (s), waiting for the browser.
     pub sso_since: Option<f64>,
+    /// The one-time state sent with it, and the server it was sent to.
+    pub sso_state: Option<(String, String)>,
     pub server: String,
     pub login_id: String,
     pub password: String,
@@ -415,6 +423,8 @@ pub struct App {
     next_local: u64,
     last_typing: f64,
     last_view_sent: HashMap<String, f64>,
+    pending_views: std::collections::HashSet<String>,
+    retry_start_at: Option<f64>,
     system_dark: Option<bool>,
     signed_in_at: Option<std::time::Instant>,
     keychain: Option<std::sync::mpsc::Receiver<Option<String>>>,
@@ -493,6 +503,8 @@ impl App {
             next_local: 1,
             last_typing: 0.0,
             last_view_sent: HashMap::new(),
+            pending_views: Default::default(),
+            retry_start_at: None,
             system_dark: None,
             signed_in_at: None,
             keychain: None,
@@ -532,13 +544,13 @@ impl App {
         }
         app.u.login.server = if app.config.server.is_empty() { "https://".into() } else { app.config.server.clone() };
         if let Some((server, token)) = session {
-            app.start_session(server, token);
+            app.start_session(server, token, None);
         }
         app
     }
 
-    fn start_session(&mut self, server: String, token: String) {
-        self.backend.send(Command::Start { server: server.clone(), token: token.clone() });
+    fn start_session(&mut self, server: String, token: String, user_id: Option<String>) {
+        self.backend.send(Command::Start { server: server.clone(), token: token.clone(), user_id });
         self.session = Some((server, token));
         self.d.logged_in = true;
     }
@@ -581,16 +593,33 @@ impl App {
                 self.u.login.busy = false;
                 self.u.login.error = Some(err);
             }
-            Event::LoggedIn { server, token } => {
+            Event::LoggedIn { server, token, user_id } => {
                 self.signed_in_at = Some(std::time::Instant::now());
                 self.u.login.busy = false;
                 self.u.login.error = None;
                 self.u.login.password.clear();
                 self.u.login.token.clear();
-                config::save_token(&server, &token);
+                // The keychain may prompt or be slow: never on the UI thread.
+                let (srv, tok) = (server.clone(), token.clone());
+                std::thread::spawn(move || config::save_token(&srv, &tok));
                 self.config.server = server.clone();
+                self.config.accounts.insert(server.clone(), user_id.clone());
                 self.config.save(&self.dirs);
-                self.start_session(server, token);
+                self.start_session(server, token, Some(user_id));
+            }
+            Event::StartFailed => {
+                // Offline at launch, before the account is known: retry.
+                self.retry_start_at = Some(self.u.now + 10.0);
+                ctx.request_repaint_after(std::time::Duration::from_secs(10));
+            }
+            Event::SessionUser { server, user_id } => {
+                self.config.accounts.insert(server, user_id);
+            }
+            Event::OlderFailed { channel_id } => {
+                if let Some(view) = d.views.get_mut(&channel_id) {
+                    view.loading_older = false;
+                    view.older_failed_at = Some(self.u.now);
+                }
             }
             Event::Snapshot { snap, from_cache } => {
                 let first = !d.have_data;
@@ -631,13 +660,16 @@ impl App {
                 if first {
                     self.backend.send(Command::LoadEmoji);
                 }
+                if !from_cache {
+                    self.backend.send(Command::LoadThreads { team_id: d.team.clone() });
+                }
                 if first || !d.channels.contains_key(&d.current) {
                     let team = d.team.clone();
                     if let Some(id) = self.default_channel(&team) {
                         self.actions.push(Action::OpenChannel(id));
                     }
-                } else if !d.current.is_empty() {
-                    // The open channel stays read.
+                } else if !d.current.is_empty() && d.center == Center::Channel && self.u.focused && self.has_window {
+                    // The open channel stays read, while someone is reading it.
                     self.mark_read_locally(&self.d.current.clone());
                 }
             }
@@ -657,8 +689,14 @@ impl App {
                         }
                     }
                     PostsMode::Merge => {
+                        let oldest = view.posts.iter().find(|p| !p.pending).map(|p| p.create_at);
                         for p in posts {
-                            view.upsert(p);
+                            // Older than what is shown: paging will bring it in
+                            // order; inserting it now would make paging skip.
+                            let inside = oldest.is_none_or(|o| p.create_at >= o) || view.posts.iter().any(|q| q.id == p.id);
+                            if inside {
+                                view.upsert(p);
+                            }
                         }
                         view.server_loaded = true;
                     }
@@ -679,10 +717,17 @@ impl App {
                 if let Some(t) = &mut d.thread
                     && t.root_id == root_id
                 {
-                    let pending: Vec<Post> = t.posts.drain(..).filter(|p| p.pending).collect();
+                    let newest = posts.iter().map(|p| p.create_at).max().unwrap_or(0);
+                    let keep: Vec<Post> = t
+                        .posts
+                        .drain(..)
+                        .filter(|p| p.pending || (p.create_at > newest && !posts.iter().any(|q| q.id == p.id)))
+                        .collect();
                     t.posts = posts;
                     t.posts.sort_by_key(|p| p.create_at);
-                    t.posts.extend(pending);
+                    for p in keep {
+                        t.upsert(p);
+                    }
                     t.loaded = true;
                     let count = t.posts.iter().filter(|p| !p.root_id.is_empty() && !p.pending).count() as i64;
                     d.for_each_post(&root_id, |p| p.reply_count = count);
@@ -759,9 +804,8 @@ impl App {
                 }
             }
             Event::ThreadUpdated => {
-                if d.center == Center::Threads {
-                    self.backend.send(Command::LoadThreads { team_id: d.team.clone() });
-                }
+                // The sidebar's Threads badge needs the totals in any view.
+                self.backend.send(Command::LoadThreads { team_id: d.team.clone() });
             }
             Event::UploadDone { local_id, result } => {
                 for c in self.u.composers.values_mut() {
@@ -847,7 +891,7 @@ impl App {
             }
             Event::Unauthorized => {
                 if let Some((server, _)) = self.session.take() {
-                    config::forget_token(&server);
+                    std::thread::spawn(move || config::forget_token(&server));
                 }
                 self.backend.send(Command::Logout);
                 self.d.logged_in = false;
@@ -894,6 +938,10 @@ impl App {
             self.backend.send(Command::Resync);
             return;
         };
+        // A snapshot taken after this post already counted it.
+        if post.create_at <= ch.last_post_at {
+            return;
+        }
         ch.total_msg_count += 1;
         if post.root_id.is_empty() {
             ch.total_msg_count_root += 1;
@@ -943,7 +991,23 @@ impl App {
         let last = self.last_view_sent.get(channel_id).copied().unwrap_or(-10.0);
         if self.u.now - last > 1.0 {
             self.last_view_sent.insert(channel_id.to_string(), self.u.now);
+            self.pending_views.remove(channel_id);
             self.backend.send(Command::ViewChannel { channel_id: channel_id.to_string() });
+        } else {
+            // Too soon after the last one: send it once the second is up.
+            self.pending_views.insert(channel_id.to_string());
+        }
+    }
+
+    fn flush_views(&mut self) {
+        let due: Vec<String> = self
+            .pending_views
+            .iter()
+            .filter(|c| self.u.now - self.last_view_sent.get(*c).copied().unwrap_or(-10.0) > 1.0)
+            .cloned()
+            .collect();
+        for c in due {
+            self.send_view(&c);
         }
     }
 
@@ -1014,6 +1078,14 @@ impl App {
                 self.d.center = Center::Channel;
                 self.d.current = id.clone();
                 if switching {
+                    // Bound memory: channels not on screen keep their newest posts.
+                    for (cid, v) in self.d.views.iter_mut() {
+                        if cid != &id && v.posts.len() > 300 {
+                            let cut = v.posts.len() - 150;
+                            v.posts.drain(..cut);
+                            v.reached_start = false;
+                        }
+                    }
                     let (unread, _) = self.d.unread(&ch);
                     let last_viewed = self.d.members.get(&id).map(|m| m.last_viewed_at).unwrap_or(0);
                     let view = self.d.views.entry(id.clone()).or_default();
@@ -1107,10 +1179,12 @@ impl App {
                 }
             }
             Action::LoadOlder(channel_id) => {
+                let now = self.u.now;
                 if let Some(view) = self.d.views.get_mut(&channel_id)
                     && !view.loading_older
                     && !view.reached_start
                     && view.server_loaded
+                    && view.older_failed_at.is_none_or(|t| now - t > 5.0)
                     && let Some(first) = view.posts.iter().find(|p| !p.pending)
                 {
                     view.loading_older = true;
@@ -1148,11 +1222,13 @@ impl App {
                     *s = SearchData { seq: s.seq, ..Default::default() };
                     return;
                 }
+                // Results belong to one query; typing starts over.
+                s.server = None;
+                s.files.clear();
+                s.error = None;
+                s.loading = false;
                 if server {
                     s.loading = true;
-                    s.server = None;
-                    s.files.clear();
-                    s.error = None;
                     self.d.rhs = Rhs::Search;
                 }
                 s.terms = terms.clone();
@@ -1186,7 +1262,14 @@ impl App {
             Action::Link(link) => match link {
                 Link::Url(url) => {
                     if !self.open_in_app(ctx, &url) {
-                        let _ = open::that_detached(url);
+                        // Message links are other people's text: hand only web
+                        // and mail links to the system, never file: or app schemes.
+                        let scheme = url::Url::parse(&url).map(|u| u.scheme().to_string()).unwrap_or_default();
+                        if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+                            let _ = open::that_detached(url);
+                        } else {
+                            self.u.toast(format!("Not opening a {scheme}: link"));
+                        }
                     }
                 }
                 Link::User(name) => match self.d.by_name.get(&name).cloned() {
@@ -1252,10 +1335,14 @@ impl App {
                 let f = &mut self.u.login;
                 f.busy = true;
                 f.error = None;
-                self.backend.send(Command::SsoStart { server: f.server.clone() });
+                let state = random_state();
+                f.sso_state = Some((state.clone(), crate::api::normalize_server(&f.server)));
+                let redirect = format!("{SSO_REDIRECT}?state={state}");
+                self.backend.send(Command::SsoStart { server: f.server.clone(), redirect });
             }
             Action::CancelSso => {
                 self.u.login.sso_since = None;
+                self.u.login.sso_state = None;
                 self.u.login.busy = false;
             }
             Action::Login => {
@@ -1271,7 +1358,7 @@ impl App {
             }
             Action::Logout => {
                 if let Some((server, _)) = self.session.take() {
-                    config::forget_token(&server);
+                    std::thread::spawn(move || config::forget_token(&server));
                 }
                 self.backend.send(Command::Logout);
                 let theme = self.d.theme.clone();
@@ -1412,34 +1499,26 @@ impl App {
     /// A link handed to the app: the end of single sign-on. Only accepted
     /// while a sign-on we started is waiting, so a stray link cannot sign
     /// the app into someone else's account.
+    // Only macOS delivers mmauth:// links so far (see src/macos.rs).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn on_link(&mut self, link: &str) {
-        let Ok(url) = url::Url::parse(link) else { return };
-        if url.scheme() != "mmauth" {
-            log::warn!("ignoring a link of scheme {}", url.scheme());
-            return;
-        }
         let waiting = self.u.login.sso_since.is_some_and(|t| self.u.now - t < 900.0);
-        if !waiting || self.d.logged_in {
+        // Single use: whatever happens, this sign-on is over.
+        let pending = self.u.login.sso_state.take();
+        self.u.login.sso_since = None;
+        let (Some((state, server)), true, false) = (pending, waiting, self.d.logged_in) else {
             log::warn!("ignoring a sign-in link nobody asked for");
             return;
-        }
-        let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let Some(token) = query.get("MMAUTHTOKEN").filter(|t| !t.is_empty()) else {
-            self.u.login.error = Some("The server did not send a session back.".into());
-            self.u.login.sso_since = None;
-            return;
         };
-        if let Some(srv) = query.get("srv")
-            && crate::api::normalize_server(srv) != crate::api::normalize_server(&self.u.login.server)
-        {
-            self.u.login.error = Some(format!("The sign-in came back from {srv}, not the server you chose."));
-            self.u.login.sso_since = None;
-            return;
+        match check_sso_link(link, &state, &server) {
+            Ok(token) => {
+                self.u.login.server = server;
+                self.u.login.token = token;
+                self.u.login.use_token = true;
+                self.actions.push(Action::Login);
+            }
+            Err(msg) => self.u.login.error = Some(msg),
         }
-        self.u.login.sso_since = None;
-        self.u.login.token = token.clone();
-        self.u.login.use_token = true;
-        self.actions.push(Action::Login);
     }
 
     pub fn frame_start(&mut self, ctx: &egui::Context) {
@@ -1447,8 +1526,14 @@ impl App {
         for link in crate::macos::links::take() {
             self.on_link(&link);
         }
-        self.u.now = ctx.input(|i| i.time);
+        // One process-wide clock: egui's restarts with each new window,
+        // but deadlines and throttles outlive windows.
+        self.u.now = self.started.elapsed().as_secs_f64();
         self.u.focused = ctx.input(|i| i.focused);
+        self.flush_views();
+        if !self.pending_views.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         self.u.images.begin_frame(ctx.cumulative_frame_nr());
         self.apply_theme(ctx);
         let now = self.u.now;
@@ -1511,6 +1596,37 @@ fn empty_data() -> Data {
 /// (NativeAppSettings.AppCustomURLSchemes) and our app bundle answers.
 pub const SSO_REDIRECT: &str = "mmauth://callback";
 
+/// 128 random bits, hex: the one-time value a sign-on must bring back.
+fn random_state() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("system randomness");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Accept a returned sign-on link only if it is our callback, carries the
+/// state we sent, names the server we chose, and holds a token.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn check_sso_link(link: &str, state: &str, server: &str) -> Result<String, String> {
+    let url = url::Url::parse(link).map_err(|_| "The sign-in link was not readable.".to_string())?;
+    if url.scheme() != "mmauth" || url.host_str() != Some("callback") {
+        return Err("The sign-in came back to an unexpected address.".into());
+    }
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    if query.get("state").map(String::as_str) != Some(state) {
+        return Err("The sign-in did not come from the request mmfast made. Please try again.".into());
+    }
+    match query.get("srv") {
+        Some(srv) if crate::api::normalize_server(srv) == server => {}
+        Some(srv) => return Err(format!("The sign-in came back from {srv}, not the server you chose.")),
+        None => return Err("The sign-in did not say which server it came from.".into()),
+    }
+    query
+        .get("MMAUTHTOKEN")
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .ok_or_else(|| "The server did not send a session back.".into())
+}
+
 /// The seeded local test server (dev/seed.py), for `--dev`.
 fn dev_session() -> Option<(String, String)> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev/seed-credentials.json");
@@ -1550,9 +1666,20 @@ impl App {
         {
             self.keychain = None;
             match token {
-                Some(token) => self.start_session(self.config.server.clone(), token),
+                Some(token) => {
+                    let server = self.config.server.clone();
+                    let user = self.config.accounts.get(&server).cloned();
+                    self.start_session(server, token, user)
+                }
                 None => self.d.logged_in = false,
             }
+        }
+        if self.retry_start_at.is_some_and(|t| self.u.now >= t)
+            && let Some((server, token)) = self.session.clone()
+        {
+            self.retry_start_at = None;
+            let user = self.config.accounts.get(&server).cloned();
+            self.start_session(server, token, user);
         }
         self.drain_events(ctx);
         let events = self.tray.as_ref().map(|t| t.events()).unwrap_or_default();
@@ -1701,6 +1828,32 @@ mod tests {
         v.upsert(post("b", 2));
         let ids: Vec<&str> = v.posts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c", "me:5"]);
+    }
+
+    #[test]
+    fn sso_links_must_match_state_server_and_callback() {
+        let s = "http://localhost:8065";
+        let ok = "mmauth://callback?state=abc&MMAUTHTOKEN=tok&MMCSRF=x&srv=http%3A%2F%2Flocalhost%3A8065";
+        assert_eq!(check_sso_link(ok, "abc", s), Ok("tok".to_string()));
+        assert!(check_sso_link(ok, "other", s).is_err(), "wrong state");
+        assert!(check_sso_link("mmauth://callback?state=abc&MMAUTHTOKEN=tok", "abc", s).is_err(), "no server");
+        assert!(check_sso_link("mmauth://evil?state=abc&MMAUTHTOKEN=tok&srv=http://localhost:8065", "abc", s).is_err());
+        assert!(check_sso_link("mmauth://callback?state=abc&MMAUTHTOKEN=tok&srv=https://attacker.example", "abc", s).is_err());
+        assert!(check_sso_link("mmauth://callback?state=abc&srv=http://localhost:8065", "abc", s).is_err(), "no token");
+    }
+
+    #[test]
+    fn an_older_answer_does_not_overwrite_a_newer_post() {
+        let mut v = ChannelView::default();
+        let mut newer = post("a", 1);
+        newer.update_at = 20;
+        newer.message = "edited".into();
+        v.upsert(newer);
+        let mut stale = post("a", 1);
+        stale.update_at = 10;
+        stale.message = "original".into();
+        v.upsert(stale);
+        assert_eq!(v.posts[0].message, "edited");
     }
 
     #[test]

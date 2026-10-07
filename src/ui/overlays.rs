@@ -23,7 +23,9 @@ pub fn shortcuts(app: &mut App, ctx: &egui::Context) {
             app.actions.push(Action::OpenChannel(id));
         }
     }
-    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+    // An open editor (a message being edited, a dialog) gets Escape first.
+    let editing = app.u.editing.is_some() || app.u.header_editor.is_some() || app.u.confirm_delete.is_some();
+    if !editing && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
         if app.u.lightbox.is_some() {
             app.u.lightbox = None;
         } else if app.u.switcher.is_some() {

@@ -51,9 +51,16 @@ Spotifast and ZapFast (github.com/crmne) are built. Read PLAN.md for the why.
   with a `pbpaste` fallback; tray menu ids go to `fastframe_tray::claim_menu_event`
   first, and muda must stay at tray-icon's version), the `mmauth://` Apple
   Event handler (installed in `main`, before the event loop), the Dock badge.
-- Single sign-on: `Api::sso_url` picks the server's provider; the browser
-  returns `mmauth://callback?MMAUTHTOKEN=…&srv=…`, accepted only while a
-  sign-on we started is pending and only for the chosen server.
+- Single sign-on: `Api::sso_url` picks the server's provider and sends
+  `redirect_to=mmauth://callback?state=<random>`; the browser returns that
+  link with `MMAUTHTOKEN` and `srv`. `check_sso_link` accepts it once, only
+  with our state, our callback and the chosen server.
+- Sessions: the local cache is per server *and* account
+  (`servers/<host>/<user id>/`); `Session::stop` aborts every task the session
+  owns and mutes its late results; sign-out deletes the account's cache.
+- Untrusted input has budgets: math nesting and size (both parsers), markdown
+  block depth, GIF decode size; download names are reduced to one component;
+  only http/https/mailto links leave the app.
 - `src/math.rs` lays out display math (parse → boxes → paint) in STIX Two
   Math; `src/highlight.rs` colours code blocks; `src/icon.rs` draws the app
   icon and the menu-bar glyph.

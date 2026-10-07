@@ -438,6 +438,19 @@ fn latex_raw(src: &str) -> String {
     }
 
     fn convert(src: &str) -> String {
+        // Nesting and size budgets: past them the source is shown as written.
+        thread_local!(static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        let depth = DEPTH.with(|d| d.get());
+        if depth > 24 || src.len() > 4000 {
+            return src.to_string();
+        }
+        DEPTH.with(|d| d.set(depth + 1));
+        let out = convert_inner(src);
+        DEPTH.with(|d| d.set(depth));
+        out
+    }
+
+    fn convert_inner(src: &str) -> String {
         let chars: Vec<char> = src.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -462,10 +475,14 @@ fn latex_raw(src: &str) -> String {
                             out.push_str(&format!("{}/{}", wrap(&a), wrap(&b)));
                         }
                         "bar" | "overline" => {
-                            let a = convert(&group(&chars, &mut i));
-                            for ch in a.chars() {
+                            let a: Vec<char> = convert(&group(&chars, &mut i)).chars().collect();
+                            for (k, &ch) in a.iter().enumerate() {
                                 out.push(ch);
-                                out.push('\u{0304}');
+                                // One bar per base letter: a bar over a bar must
+                                // not grow the text (it once doubled per level).
+                                if !is_combining(ch) && !is_marker(ch) && a.get(k + 1) != Some(&'\u{0304}') {
+                                    out.push('\u{0304}');
+                                }
                             }
                         }
                         "hat" => {
@@ -528,6 +545,10 @@ fn latex_raw(src: &str) -> String {
 const SUB_START: char = '\u{E000}';
 const SUP_START: char = '\u{E001}';
 const SCRIPT_END: char = '\u{E002}';
+
+fn is_combining(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036F}' | '\u{20D0}'..='\u{20FF}')
+}
 
 fn is_marker(c: char) -> bool {
     matches!(c, SUB_START | SUP_START | SCRIPT_END)
@@ -755,6 +776,21 @@ pub fn show(ui: &mut Ui, doc: &Doc, rc: &RenderCtx) -> Option<Link> {
 }
 
 fn show_block(ui: &mut Ui, block: &Block, rc: &RenderCtx) -> Option<Link> {
+    // Quotes in lists in quotes…: past a sane depth, draw the rest as text.
+    thread_local!(static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    let depth = DEPTH.with(|d| d.get());
+    if depth > 12 {
+        let text = plain_blocks(std::slice::from_ref(block));
+        ui.label(egui::RichText::new(text).color(rc.theme.text_dim));
+        return None;
+    }
+    DEPTH.with(|d| d.set(depth + 1));
+    let out = show_block_inner(ui, block, rc);
+    DEPTH.with(|d| d.set(depth));
+    out
+}
+
+fn show_block_inner(ui: &mut Ui, block: &Block, rc: &RenderCtx) -> Option<Link> {
     let t = rc.theme;
     match block {
         Block::Para(inl) => paragraph(ui, inl, rc),
@@ -930,7 +966,10 @@ fn cell_label(ui: &mut Ui, inl: &[Span], rc: &RenderCtx) -> Option<Link> {
 
 /// Plain one-line preview of a message (sidebar, search, threads list).
 pub fn plain(src: &str) -> String {
-    let doc = parse(src);
+    plain_blocks(&parse(src).blocks)
+}
+
+fn plain_blocks(blocks: &[Block]) -> String {
     let mut out = String::new();
     fn walk(blocks: &[Block], out: &mut String) {
         for b in blocks {
@@ -964,7 +1003,7 @@ pub fn plain(src: &str) -> String {
             }
         }
     }
-    walk(&doc.blocks, &mut out);
+    walk(blocks, &mut out);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -979,6 +1018,20 @@ mod tests {
         assert_eq!(latex_to_unicode("\\frac{a}{b}"), "𝑎/𝑏");
         assert_eq!(latex_to_unicode("\\rho = \\log(m^2/p_T^2)"), "𝜌 = log(𝑚²/𝑝_𝑇²)");
         assert_eq!(latex_segments("m_{t\\bar{t}}"), vec![("𝑚".to_string(), 0), ("𝑡𝑡\u{304}".to_string(), -1)]);
+    }
+
+    #[test]
+    fn nested_bars_do_not_explode() {
+        let mut src = "x".to_string();
+        for _ in 0..40 {
+            src = format!("\\bar{{{src}}}");
+        }
+        let out = latex_to_unicode(&src);
+        // Linear in the input (it was 2^40 characters before).
+        assert!(out.chars().count() < 2 * src.chars().count(), "{}", out.chars().count());
+        let deep = "{".repeat(5000) + "x" + &"}".repeat(5000);
+        let _ = latex_to_unicode(&deep);
+        let _ = parse(&format!("{}x", "> ".repeat(500)));
     }
 
     #[test]

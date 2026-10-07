@@ -72,7 +72,8 @@ impl Script {
         self.wait_until = now + 0.35;
         ctx.request_repaint();
         let (cmd, arg) = step.split_once(':').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or((step.clone(), String::new()));
-        eprintln!("script: {step}");
+        // Only the step's name: arguments may be message text or a sign-in link.
+        eprintln!("script: {cmd}");
         match cmd.as_str() {
             "wait" => self.wait_until = now + arg.parse::<f64>().unwrap_or(500.0) / 1000.0,
             "channel" => {

@@ -18,7 +18,8 @@ pub enum WsEvent {
     PostDeleted(Post),
     Reaction { reaction: Reaction, added: bool },
     Typing { channel_id: String, parent_id: String, user_id: String },
-    ChannelViewed { channel_id: String },
+    /// Read elsewhere (one channel, or several at once).
+    ChannelsViewed { channel_ids: Vec<String> },
     ChannelUpdated(Channel),
     /// Membership or channel list changed; the worker refetches the sidebar.
     Resync,
@@ -61,10 +62,9 @@ fn parse(text: &str) -> Option<WsEvent> {
             parent_id: data["parent_id"].as_str().unwrap_or_default().to_string(),
             user_id: data["user_id"].as_str()?.to_string(),
         },
-        "channel_viewed" => WsEvent::ChannelViewed { channel_id: data["channel_id"].as_str()?.to_string() },
+        "channel_viewed" => WsEvent::ChannelsViewed { channel_ids: vec![data["channel_id"].as_str()?.to_string()] },
         "multiple_channels_viewed" => {
-            let first = data["channel_times"].as_object()?.keys().next()?.clone();
-            WsEvent::ChannelViewed { channel_id: first }
+            WsEvent::ChannelsViewed { channel_ids: data["channel_times"].as_object()?.keys().cloned().collect() }
         }
         "channel_updated" | "channel_converted" => WsEvent::ChannelUpdated(json_field(data, "channel")?),
         "channel_created" | "channel_deleted" | "user_added" | "user_removed" | "added_to_team"

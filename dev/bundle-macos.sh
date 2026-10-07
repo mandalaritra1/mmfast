@@ -44,8 +44,9 @@ PLIST
 if security find-identity -v -p codesigning 2>/dev/null | grep -q '"mmfast-dev"'; then
   codesign --force --sign mmfast-dev "$APP"
 else
-  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  codesign --force --sign - "$APP"
 fi
+codesign --verify --strict "$APP"
 # Tell Launch Services this bundle answers mmauth:// (single sign-on).
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" || true
 du -sh "$APP"

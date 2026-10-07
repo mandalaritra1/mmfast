@@ -397,7 +397,7 @@ impl Api {
     // ------------------------------------------------------------ threads
 
     pub async fn user_threads(&self, user_id: &str, team_id: &str) -> Result<UserThreads> {
-        self.get(&format!("/users/{user_id}/teams/{team_id}/threads?extended=true&pageSize=50")).await
+        self.get(&format!("/users/{user_id}/teams/{team_id}/threads?extended=true&per_page=50")).await
     }
 
     pub async fn mark_thread_read(&self, user_id: &str, team_id: &str, thread_id: &str) -> Result<()> {

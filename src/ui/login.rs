@@ -55,13 +55,21 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                             });
                         });
                         let _ = since;
-                    } else {
+                    } else if cfg!(target_os = "macos") {
+                        // The browser hands the session back through an mmauth://
+                        // link, which only the macOS app receives so far.
                         let btn = egui::Button::new(RichText::new("Sign in with browser (SSO)").color(t.accent_text).font(semibold(14.0)))
                             .fill(t.accent)
                             .min_size(vec2(ui.available_width(), 36.0));
                         if ui.add_enabled(!busy, btn).on_hover_text("CERN and other single sign-on servers").clicked() {
                             sso_start = true;
                         }
+                    } else {
+                        ui.label(
+                            RichText::new("Single sign-on server? Sign in in your browser, then use a token below.")
+                                .size(12.0)
+                                .color(t.text_dim),
+                        );
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {

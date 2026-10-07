@@ -134,7 +134,11 @@ fn takes_limits(name: &str) -> bool {
 struct Parser {
     c: Vec<char>,
     i: usize,
+    /// Nesting so far; past `MAX_DEPTH` the rest is skipped.
+    depth: u32,
 }
+
+const MAX_DEPTH: u32 = 32;
 
 impl Parser {
     fn peek(&self) -> Option<char> {
@@ -195,6 +199,17 @@ impl Parser {
 
     /// One argument: a {group}, a command, or a single character.
     fn argument(&mut self) -> Node {
+        if self.depth >= MAX_DEPTH {
+            self.i = self.c.len();
+            return Node::Text("…".into());
+        }
+        self.depth += 1;
+        let n = self.argument_inner();
+        self.depth -= 1;
+        n
+    }
+
+    fn argument_inner(&mut self) -> Node {
         self.skip_ws();
         match self.peek() {
             Some('{') => {
@@ -231,6 +246,17 @@ impl Parser {
     }
 
     fn row(&mut self, stop: &[&str]) -> Vec<Node> {
+        if self.depth >= MAX_DEPTH {
+            self.i = self.c.len();
+            return vec![Node::Text("…".into())];
+        }
+        self.depth += 1;
+        let r = self.row_inner(stop);
+        self.depth -= 1;
+        r
+    }
+
+    fn row_inner(&mut self, stop: &[&str]) -> Vec<Node> {
         let mut out: Vec<Node> = Vec::new();
         loop {
             self.skip_ws();
@@ -429,7 +455,10 @@ impl Parser {
 }
 
 fn parse(src: &str) -> Node {
-    let mut p = Parser { c: src.chars().collect(), i: 0 };
+    if src.len() > 6000 {
+        return Node::Text(src.chars().take(200).collect::<String>() + "…");
+    }
+    let mut p = Parser { c: src.chars().collect(), i: 0, depth: 0 };
     let mut rows = p.row(&["\\\\"]);
     // Top-level line breaks (e.g. several equations in one block) stack up.
     if p.starts("\\\\") {
@@ -799,6 +828,17 @@ mod tests {
         assert!(t.contains("Matrix"));
         let t = kinds(r"f(x) = \begin{cases} 1 & x > 0 \\ 0 & \text{otherwise} \end{cases}");
         assert!(t.contains("Matrix") && t.contains("otherwise"));
+    }
+
+    #[test]
+    fn hostile_input_is_bounded() {
+        let deep = "{".repeat(10_000) + "x" + &"}".repeat(10_000);
+        let _ = parse(&deep);
+        let fracs = "\\frac".repeat(5000);
+        let _ = parse(&fracs);
+        let bars = "\\bar{".repeat(500) + "x" + &"}".repeat(500);
+        let _ = parse(&bars);
+        let _ = parse("\\left( \\begin{pmatrix} & & \\\\ \\end");
     }
 
     #[test]

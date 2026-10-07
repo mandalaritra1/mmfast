@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "mmfast"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2709,6 +2709,7 @@ dependencies = [
  "fastframe-text",
  "fastframe-tray",
  "futures-util",
+ "getrandom 0.3.4",
  "image",
  "jiff",
  "keyring",
